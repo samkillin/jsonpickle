@@ -20,11 +20,11 @@ from jsonpickle.backend import JSONBackend
 
 
 def decode(string, backend=None, context=None, keys=False, reset=True,
-           safe=False):
+           safe=False, cls=None):
     backend = _make_backend(backend)
     if context is None:
         context = Unpickler(keys=keys, backend=backend, safe=safe)
-    return context.restore(backend.decode(string), reset=reset)
+    return context.restore(backend.decode(string), reset=reset, cls=cls)
 
 
 def _make_backend(backend):
@@ -103,7 +103,7 @@ class Unpickler(object):
         self._objs = []
         self._proxies = []
 
-    def restore(self, obj, reset=True):
+    def restore(self, obj, reset=True, cls=None):
         """Restores a flattened object to its original python state.
 
         Simply returns any of the basic builtin types
@@ -114,10 +114,13 @@ class Unpickler(object):
         >>> u.restore({'key': 'value'})
         {'key': 'value'}
 
+        cls could be either a type or an instance. In case of instance, it
+        will be used to define types inside a list or dict. eg. [Test()] means
+        a list of Test.
         """
         if reset:
             self.reset()
-        value = self._restore(obj)
+        value = self._restore(obj, cls=cls)
         if reset:
             self._swap_proxies()
         return value
@@ -128,7 +131,21 @@ class Unpickler(object):
             method(obj, attr, proxy)
         self._proxies = []
 
-    def _restore(self, obj):
+    def _restore(self, obj, cls=None):
+        restore = None
+
+        # Try and restore from an explicit class
+        if cls is not None:
+            if util.is_type(cls):
+                restore = self._restore_object_from_cls
+            elif util.is_list(cls):
+                restore = self._restore_list_from_cls
+            elif util.is_dictionary(cls):
+                restore = self._restore_dict_from_cls
+            if restore is not None:
+                return restore(obj, cls)
+
+        # Try and restore from present tags
         if has_tag(obj, tags.B64):
             restore = self._restore_base64
         elif has_tag(obj, tags.BYTES):  # Backwards compatibility
@@ -146,17 +163,17 @@ class Unpickler(object):
         elif has_tag(obj, tags.REDUCE):
             restore = self._restore_reduce
         elif has_tag(obj, tags.OBJECT):
-            restore = self._restore_object
+            restore = self._restore_object_given_tag
         elif has_tag(obj, tags.FUNCTION):
             restore = self._restore_function
         elif util.is_list(obj):
-            restore = self._restore_list
+            restore = self._restore_list_given_tag
         elif has_tag(obj, tags.TUPLE):
             restore = self._restore_tuple
         elif has_tag(obj, tags.SET):
             restore = self._restore_set
         elif util.is_dictionary(obj):
-            restore = self._restore_dict
+            restore = self._restore_dict_given_tag
         else:
             restore = lambda x: x
         return restore(obj)
@@ -169,7 +186,7 @@ class Unpickler(object):
         return quopri.decodestring(obj[tags.BYTES].encode('utf-8'))
 
     def _restore_iterator(self, obj):
-        return iter(self._restore_list(obj[tags.ITERATOR]))
+        return iter(self._restore_list_given_tag(obj[tags.ITERATOR]))
 
     def _restore_reduce(self, obj):
         """
@@ -233,7 +250,27 @@ class Unpickler(object):
         obj = loadrepr(obj[tags.REPR])
         return self._mkref(obj)
 
-    def _restore_object(self, obj):
+    def _restore_object_from_cls(self, obj, cls=None):
+        if not util.is_dictionary(obj):
+            # Type mismatch. cls is a type but we didn't get a dict
+            # from JSON. Return None.
+            return None
+
+        handler = handlers.get(cls)
+        if handler is not None:  # custom handler
+            proxy = _Proxy()
+            self._mkref(proxy)
+            instance = handler(self).restore(obj)
+            proxy.reset(instance)
+            self._swapref(proxy, instance)
+            return instance
+
+        if cls is None:
+            return self._mkref(obj)
+
+        return self._restore_object_instance(obj, cls)
+
+    def _restore_object_given_tag(self, obj):
         class_name = obj[tags.OBJECT]
         cls = loadclass(class_name)
         handler = handlers.get(cls, handlers.get(class_name))
@@ -254,6 +291,9 @@ class Unpickler(object):
         return loadclass(obj[tags.FUNCTION])
 
     def _loadfactory(self, obj):
+        if not util.is_dictionary(obj):
+            return None
+
         try:
             default_factory = obj['default_factory']
         except KeyError:
@@ -274,7 +314,7 @@ class Unpickler(object):
         if has_tag(obj, tags.NEWARGSEX):
             args, kwargs = obj[tags.NEWARGSEX]
         else:
-            args = getargs(obj)
+            args = getargs(obj, cls)
             kwargs = {}
         if args:
             args = self._restore(args)
@@ -313,40 +353,46 @@ class Unpickler(object):
                 isinstance(instance.default_factory, _Proxy)):
             instance.default_factory = instance.default_factory.get()
 
-        return self._restore_object_instance_variables(obj, instance)
+        return self._restore_object_instance_variables(obj, cls, instance)
 
-    def _restore_from_dict(self, obj, instance, ignorereserved=True):
+    def _restore_from_dict(self, obj, cls, instance, ignorereserved=True):
         restore_key = self._restore_key_fn()
         method = _obj_setattr
 
-        for k, v in sorted(obj.items(), key=util.itemgetter):
-            # ignore the reserved attribute
-            if ignorereserved and k in tags.RESERVED:
-                continue
-            if isinstance(k, numeric_types):
-                str_k = unicode(k)
+        for k in util.get_public_variables(cls):
+            if k in obj:
+                v = obj[k]
+                # ignore the reserved attribute
+                if ignorereserved and k in tags.RESERVED:
+                    continue
+                if isinstance(k, numeric_types):
+                    str_k = unicode(k)
+                else:
+                    str_k = k
+                self._namestack.append(str_k)
+                k = restore_key(k)
+                # step into the namespace
+                value = self._restore(v)
+                if (util.is_noncomplex(instance) or
+                        util.is_dictionary_subclass(instance)):
+                    instance[k] = value
+                else:
+                    setattr(instance, k, value)
+
+                # This instance has an instance variable named `k` that is
+                # currently a proxy and must be replaced
+                if isinstance(value, _Proxy):
+                    self._proxies.append((instance, k, value, method))
+
+                # step out
+                self._namestack.pop()
             else:
-                str_k = k
-            self._namestack.append(str_k)
-            k = restore_key(k)
-            # step into the namespace
-            value = self._restore(v)
-            if (util.is_noncomplex(instance) or
-                    util.is_dictionary_subclass(instance)):
-                instance[k] = value
-            else:
-                setattr(instance, k, value)
+                # Attribute in cls but not given in JSON. Assign it to
+                # None so that user could tell that it wasn't given.
+                setattr(instance, k, None)
 
-            # This instance has an instance variable named `k` that is
-            # currently a proxy and must be replaced
-            if isinstance(value, _Proxy):
-                self._proxies.append((instance, k, value, method))
-
-            # step out
-            self._namestack.pop()
-
-    def _restore_object_instance_variables(self, obj, instance):
-        self._restore_from_dict(obj, instance)
+    def _restore_object_instance_variables(self, obj, cls, instance):
+        self._restore_from_dict(obj, cls, instance)
 
         # Handle list and set subclasses
         if has_tag(obj, tags.SEQ):
@@ -358,11 +404,11 @@ class Unpickler(object):
                     instance.add(self._restore(v))
 
         if has_tag(obj, tags.STATE):
-            instance = self._restore_state(obj, instance)
+            instance = self._restore_state(obj, cls, instance)
 
         return instance
 
-    def _restore_state(self, obj, instance):
+    def _restore_state(self, obj, cls, instance):
         state = self._restore(obj[tags.STATE])
         has_slots = (isinstance(state, tuple) and len(state) == 2
                      and isinstance(state[1], dict))
@@ -373,11 +419,11 @@ class Unpickler(object):
             # implements described default handling
             # of state for object with instance dict
             # and no slots
-            self._restore_from_dict(state, instance, ignorereserved=False)
+            self._restore_from_dict(state, cls, instance, ignorereserved=False)
         elif has_slots:
-            self._restore_from_dict(state[1], instance, ignorereserved=False)
+            self._restore_from_dict(state[1], cls, instance, ignorereserved=False)
             if has_slots_and_dict:
-                self._restore_from_dict(state[0],
+                self._restore_from_dict(state[0], cls,
                                         instance, ignorereserved=False)
         elif (not hasattr(instance, '__getnewargs__')
               and not hasattr(instance, '__getnewargs_ex__')):
@@ -388,7 +434,26 @@ class Unpickler(object):
             instance = state
         return instance
 
-    def _restore_list(self, obj):
+    def _restore_list_from_cls(self, obj, cls):
+        parent = type(cls)()
+        self._mkref(parent)
+        item_type = get_sequence_item_type(cls)
+        is_set = type(parent) is set
+        for v in obj:
+            restored_v = self.restore(v, item_type)
+            if is_set:
+                parent.add(restored_v)
+            else:
+                parent.append(restored_v)
+
+        method = _obj_setvalue
+        proxies = [(parent, idx, value, method)
+                    for idx, value in enumerate(parent)
+                        if isinstance(value, _Proxy)]
+        self._proxies.extend(proxies)
+        return parent
+
+    def _restore_list_given_tag(self, obj):
         parent = []
         self._mkref(parent)
         children = [self._restore(v) for v in obj]
@@ -406,7 +471,22 @@ class Unpickler(object):
     def _restore_set(self, obj):
         return set([self._restore(v) for v in obj[tags.SET]])
 
-    def _restore_dict(self, obj):
+    def _restore_dict_from_cls(self, obj, cls):
+        data = type(cls)()
+        restore_key = self._restore_key_fn()
+        k_type, v_type = get_dictionary_item_type(cls)
+        for k, v in sorted(obj.items(), key=util.itemgetter):
+            if isinstance(k, numeric_types):
+                str_k = unicode(k)
+            else:
+                str_k = k
+            self._namestack.append(str_k)
+            k = restore_key(k)
+            data[self.restore(k, k_type)] = self.restore(v, v_type)
+            self._namestack.pop()
+        return data
+
+    def _restore_dict_given_tag(self, obj):
         data = {}
         restore_key = self._restore_key_fn()
         for k, v in sorted(obj.items(), key=util.itemgetter):
@@ -517,7 +597,7 @@ def loadclass(module_and_name):
         return None
 
 
-def getargs(obj):
+def getargs(obj, cls):
     """Return arguments suitable for __new__()"""
     # Let saved newargs take precedence over everything
     if has_tag(obj, tags.NEWARGSEX):
@@ -529,16 +609,12 @@ def getargs(obj):
     if has_tag(obj, tags.INITARGS):
         return obj[tags.INITARGS]
 
-    try:
-        seq_list = obj[tags.SEQ]
-        obj_dict = obj[tags.OBJECT]
-    except KeyError:
+    if not cls or tags.SEQ not in obj:
         return []
-    typeref = loadclass(obj_dict)
-    if not typeref:
-        return []
-    if hasattr(typeref, '_fields'):
-        if len(typeref._fields) == len(seq_list):
+
+    seq_list = obj[tags.SEQ]
+    if hasattr(cls, '_fields'):
+        if len(cls._fields) == len(seq_list):
             return seq_list
     return []
 
@@ -593,3 +669,38 @@ def has_tag(obj, tag):
 
     """
     return type(obj) is dict and tag in obj
+
+
+def get_attr_cls(cls, k):
+    if not cls or not k:
+        return None
+
+    attr = getattr(cls, k)
+
+    return get_obj_cls(attr)
+
+
+def get_obj_cls(obj):
+    if not obj or util.is_function(obj):
+        return None
+
+    if util.is_container(obj):
+        return obj
+
+    if not util.is_primitive(obj):
+        return type(obj)
+
+    return None
+
+
+def get_sequence_item_type(cls):
+    if cls and util.is_sequence(cls):
+        return get_obj_cls(cls.__iter__().next())
+    return None
+
+
+def get_dictionary_item_type(cls):
+    if cls and util.is_dictionary(cls):
+        k, v = cls.iteritems().next()
+        return get_obj_cls(k), get_obj_cls(v)
+    return None, None

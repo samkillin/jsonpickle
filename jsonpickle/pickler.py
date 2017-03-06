@@ -256,7 +256,7 @@ class Pickler(object):
     def _flatten_obj_instance(self, obj):
         """Recursively flatten an instance and return a json-friendly dict
         """
-        data = {}
+        data = ObjDict(obj)
         has_class = hasattr(obj, '__class__')
         has_dict = hasattr(obj, '__dict__')
         has_slots = not has_dict and hasattr(obj, '__slots__')
@@ -490,10 +490,7 @@ class Pickler(object):
             if self.numeric_keys and isinstance(k, numeric_types):
                 pass
             elif not isinstance(k, (str, unicode)):
-                try:
-                    k = repr(k)
-                except:
-                    k = unicode(k)
+                k = self.flatten(k)
 
         data[k] = self._flatten(v)
         return data
@@ -545,3 +542,19 @@ def _wrap_string_slot(string):
     if isinstance(string, (str, unicode)):
         return (string,)
     return string
+
+
+class ObjDict(dict):
+    """Behaves just like a dict, except its __hash__() and __eq__() returns
+    hash and equality of the original object, allowing this dict to be used as
+    key."""
+
+    def __init__(self, obj):
+        super(ObjDict, self).__init__()
+        self.__obj = obj
+
+    def __hash__(self):
+        return hash(self.__obj)
+
+    def __eq__(self, other):
+        return self.__obj == other.__obj

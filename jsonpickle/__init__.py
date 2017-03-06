@@ -135,7 +135,7 @@ def encode(value,
                           numeric_keys=numeric_keys)
 
 
-def decode(string, backend=None, keys=False):
+def decode(string, backend=None, keys=False, cls=None):
     """Convert a JSON string into a Python object.
 
     The keyword argument 'keys' defaults to False.
@@ -149,7 +149,7 @@ def decode(string, backend=None, keys=False):
     """
     if backend is None:
         backend = json
-    return unpickler.decode(string, backend=backend, keys=keys)
+    return unpickler.decode(string, backend=backend, keys=keys, cls=cls)
 
 
 # json.load(),loads(), dump(), dumps() compatibility

@@ -479,3 +479,14 @@ def b64decode(payload):
 
 def itemgetter(obj, getter=operator.itemgetter(0)):
     return unicode(getter(obj))
+
+
+def is_container(obj):
+    return is_dictionary(obj) or is_sequence(obj)
+
+
+def get_public_variables(t):
+    """Returns public variables of a type t."""
+    return [i[0] for i in
+            inspect.getmembers(t, lambda i: not inspect.isroutine(i))
+            if not i[0].startswith("__")]
